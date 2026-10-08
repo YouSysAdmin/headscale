@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
@@ -350,6 +351,12 @@ func (h *Headscale) waitForFollowup(
 
 			return nodeToRegisterResponse(verdict.Node), nil
 		}
+
+		// Without this the client would get a fresh AuthURL and prompt the
+		// user to log in again, never learning why it was refused.
+		if errors.Is(verdict.Err, state.ErrUserNodeLimitReached) {
+			return &tailcfg.RegisterResponse{Error: verdict.Err.Error()}, nil
+		}
 	}
 
 	// if the follow-up registration isn't found anymore, instruct the client to try a new registration
@@ -426,6 +433,11 @@ func (h *Headscale) handleRegisterWithAuthKey(
 
 		if perr, ok := errors.AsType[types.PAKError](err); ok {
 			return nil, NewHTTPError(http.StatusUnauthorized, perr.Error(), nil)
+		}
+
+		// The client shows RegisterResponse.Error to the user verbatim.
+		if errors.Is(err, state.ErrUserNodeLimitReached) {
+			return &tailcfg.RegisterResponse{Error: err.Error()}, nil
 		}
 
 		return nil, err

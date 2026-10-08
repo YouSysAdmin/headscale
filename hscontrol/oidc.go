@@ -15,6 +15,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -954,6 +955,17 @@ func (a *AuthProviderOIDC) RegisterConfirmHandler(
 				http.StatusGone,
 				registrationLinkSpentMsg,
 				registrationLinkSpentUserMsg,
+				err,
+			))
+
+			return
+		}
+
+		if errors.Is(err, state.ErrUserNodeLimitReached) {
+			httpUserError(writer, newHTTPUserError(
+				http.StatusForbidden,
+				"node limit reached",
+				"You have reached the maximum number of devices allowed for your account. Contact your administrator",
 				err,
 			))
 

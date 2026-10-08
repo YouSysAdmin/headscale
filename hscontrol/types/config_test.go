@@ -940,3 +940,73 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 		t.Errorf("SetExtraRecords mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestNodeLimitsConfig(t *testing.T) {
+	load := func(t *testing.T, limits string) (*Config, error) {
+		t.Helper()
+
+		tmpDir := t.TempDir()
+		configYaml := []byte(`---
+noise:
+  private_key_path: noise_private.key
+server_url: http://127.0.0.1:8080
+prefixes:
+  v4: 100.64.0.0/10
+database:
+  type: sqlite
+dns:
+  magic_dns: false
+  override_local_dns: false
+` + limits)
+
+		err := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), configYaml, 0o600)
+		require.NoError(t, err)
+
+		viper.Reset()
+
+		err = LoadConfig(tmpDir, false)
+		require.NoError(t, err)
+
+		return LoadServerConfig()
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := load(t, "")
+		require.NoError(t, err)
+
+		assert.Equal(t, NodeLimitsConfig{
+			ExemptUsers:    []string{},
+			CountExpired:   true,
+			CountEphemeral: true,
+		}, cfg.Node.Limits)
+		assert.False(t, cfg.Node.Limits.Enabled())
+	})
+
+	t.Run("configured", func(t *testing.T) {
+		cfg, err := load(t, `node:
+  limits:
+    max_nodes_per_user: 2
+    exempt_users: [admin, ops@example.com]
+    count_expired: false
+    count_ephemeral: false
+    enforce_on_reauth: true
+`)
+		require.NoError(t, err)
+
+		assert.Equal(t, NodeLimitsConfig{
+			MaxNodesPerUser: 2,
+			ExemptUsers:     []string{"admin", "ops@example.com"},
+			EnforceOnReauth: true,
+		}, cfg.Node.Limits)
+		assert.True(t, cfg.Node.Limits.Enabled())
+	})
+
+	t.Run("negative limit is rejected", func(t *testing.T) {
+		_, err := load(t, `node:
+  limits:
+    max_nodes_per_user: -1
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "node.limits.max_nodes_per_user must not be negative")
+	})
+}

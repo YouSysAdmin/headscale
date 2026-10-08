@@ -176,6 +176,30 @@ node:
       # Must be >= 1s and less than probe_interval.
       probe_timeout: 5s
 
+  # Per-user node limits.
+  #
+  # A registration that would give a user more than max_nodes_per_user nodes
+  # is refused, and the tailscale client shows the reason.
+  # Tagged nodes are owned by their tags, not a user, and never count.
+  limits:
+    # Maximum number of nodes a single user may own.
+    # 0 disables the limit.
+    max_nodes_per_user: 0
+
+    # Users the limit does not apply to. An entry matches a user's name or email.
+    exempt_users: []
+
+    # Whether nodes with an expired key count towards the limit.
+    count_expired: true
+
+    # Whether ephemeral nodes count towards the limit.
+    count_ephemeral: true
+
+    # When false, the limit is only checked when a new node registers.
+    # When true, re-authenticating an existing node is also refused while the
+    # user owns more nodes than the limit allows (e.g. after lowering it).
+    enforce_on_reauth: false
+
 database:
   # Database type. Available options: sqlite, postgres
   # Please note that using Postgres is highly discouraged as it is only supported for legacy reasons.

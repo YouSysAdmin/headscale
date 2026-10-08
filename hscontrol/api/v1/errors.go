@@ -39,6 +39,9 @@ func mapError(msg string, err error) error {
 		errors.Is(err, db.ErrSingleUseAuthKeyHasBeenUsed):
 		return huma.Error400BadRequest(msg, err)
 
+	case errors.Is(err, state.ErrUserNodeLimitReached):
+		return huma.Error403Forbidden(msg, err)
+
 	case errors.Is(err, state.ErrNodeKeyInUse),
 		errors.Is(err, state.ErrAmbiguousNodeOwnership):
 		return huma.Error409Conflict(msg, err)

@@ -90,6 +90,35 @@ type PreAuthKeysConfig struct {
 	RevokedRetention time.Duration
 }
 
+// NodeLimitsConfig contains configuration for limiting how many nodes a
+// user may own. Tagged nodes are owned by their tags, not a user, so they
+// never count towards the limit.
+type NodeLimitsConfig struct {
+	// MaxNodesPerUser is the maximum number of user-owned nodes a single user may register.
+	// Zero means no limit.
+	MaxNodesPerUser int
+
+	// ExemptUsers lists users the limit does not apply to.
+	// An entry matches a user's name or email.
+	ExemptUsers []string
+
+	// CountExpired makes nodes with an expired key count towards the limit.
+	CountExpired bool
+
+	// CountEphemeral makes ephemeral nodes count towards the limit.
+	CountEphemeral bool
+
+	// EnforceOnReauth rejects re-authentication of an existing node while
+	// its user owns more nodes than the limit allows. When false, the limit
+	// is only checked when a new node is created.
+	EnforceOnReauth bool
+}
+
+// Enabled reports whether a per-user node limit is configured.
+func (c NodeLimitsConfig) Enabled() bool {
+	return c.MaxNodesPerUser > 0
+}
+
 // NodeConfig contains configuration for node lifecycle and expiry.
 type NodeConfig struct {
 	// Expiry is the default key expiry duration for non-tagged nodes.
@@ -103,6 +132,9 @@ type NodeConfig struct {
 
 	// Routes contains configuration for route behaviour.
 	Routes RouteConfig
+
+	// Limits contains configuration for per-user node limits.
+	Limits NodeLimitsConfig
 }
 
 // Config contains the initial Headscale configuration.
@@ -486,6 +518,11 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("preauth_keys.revoked_retention", "168h")
 	viper.SetDefault("node.routes.ha.probe_interval", "10s")
 	viper.SetDefault("node.routes.ha.probe_timeout", "5s")
+	viper.SetDefault("node.limits.max_nodes_per_user", 0)
+	viper.SetDefault("node.limits.exempt_users", []string{})
+	viper.SetDefault("node.limits.count_expired", true)
+	viper.SetDefault("node.limits.count_ephemeral", true)
+	viper.SetDefault("node.limits.enforce_on_reauth", false)
 
 	viper.SetDefault("tuning.notifier_send_timeout", "800ms")
 	viper.SetDefault("tuning.batch_change_delay", "800ms")
@@ -743,6 +780,14 @@ func validateServerConfigInto(v *configValidator) {
 				Hint: "lower probe_timeout below probe_interval (a probe must finish before the next one starts)",
 			})
 		}
+	}
+
+	if maxNodes := viper.GetInt("node.limits.max_nodes_per_user"); maxNodes < 0 {
+		v.Add(&ConfigError{
+			Reason:  "node.limits.max_nodes_per_user must not be negative",
+			Current: []KV{{"node.limits.max_nodes_per_user", maxNodes}},
+			Hint:    "use 0 to disable the limit",
+		})
 	}
 
 	// Validate tuning parameters
@@ -1408,6 +1453,13 @@ func LoadServerConfig() (*Config, error) {
 					ProbeInterval: viper.GetDuration("node.routes.ha.probe_interval"),
 					ProbeTimeout:  viper.GetDuration("node.routes.ha.probe_timeout"),
 				},
+			},
+			Limits: NodeLimitsConfig{
+				MaxNodesPerUser: viper.GetInt("node.limits.max_nodes_per_user"),
+				ExemptUsers:     viper.GetStringSlice("node.limits.exempt_users"),
+				CountExpired:    viper.GetBool("node.limits.count_expired"),
+				CountEphemeral:  viper.GetBool("node.limits.count_ephemeral"),
+				EnforceOnReauth: viper.GetBool("node.limits.enforce_on_reauth"),
 			},
 		},
 

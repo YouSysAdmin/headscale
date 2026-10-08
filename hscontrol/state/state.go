@@ -128,6 +128,11 @@ var ErrNodeKeyInUse = errors.New("node key already in use by another machine")
 // registration is rejected rather than mutating an arbitrarily-picked node.
 var ErrAmbiguousNodeOwnership = errors.New("machine key maps to ambiguous node ownership")
 
+// ErrUserNodeLimitReached is returned when registering a node would exceed
+// node.limits.max_nodes_per_user for the owning user.
+// Its message is shown to the tailscale client, so it is phrased for the person running it.
+var ErrUserNodeLimitReached = errors.New("node limit reached")
+
 // sshCheckPair identifies a (source, destination) node pair for
 // SSH check auth tracking.
 type sshCheckPair struct {
@@ -202,6 +207,12 @@ type State struct {
 	// ponytail: entries are never pruned; bounded by distinct machine keys
 	// seen, add cleanup on node delete only if it ever matters.
 	registerLocks *xsync.Map[key.MachinePublic, *sync.Mutex]
+
+	// userRegisterLocks serialises registration per user while a node limit
+	// is configured, so registrations of different machines for the same user
+	// cannot both pass [State.checkUserNodeLimit] before either is stored.
+	// Always taken after the machine key lock.
+	userRegisterLocks *xsync.Map[types.UserID, *sync.Mutex]
 }
 
 // lockRegistration serialises registration for a single machine key and
@@ -211,6 +222,60 @@ func (s *State) lockRegistration(machineKey key.MachinePublic) func() {
 	mu.Lock()
 
 	return mu.Unlock
+}
+
+// lockUserRegistration serialises registration for a single user when a node
+// limit is configured and returns the unlock function. It is a no-op without a limit.
+func (s *State) lockUserRegistration(userID types.UserID) func() {
+	if !s.cfg.Node.Limits.Enabled() {
+		return func() {}
+	}
+
+	mu, _ := s.userRegisterLocks.LoadOrStore(userID, &sync.Mutex{})
+	mu.Lock()
+
+	return mu.Unlock
+}
+
+// checkUserNodeLimit returns [ErrUserNodeLimitReached] if user may not own
+// another node under node.limits. existing is the node being re-authenticated,
+// or an invalid view when a new node is about to be created.
+// It is never counted against itself.
+// Tagged nodes are owned by their tags and never count.
+// Callers must hold [State.lockUserRegistration] for user.
+func (s *State) checkUserNodeLimit(user *types.User, existing types.NodeView) error {
+	limits := s.cfg.Node.Limits
+	if !limits.Enabled() || (existing.Valid() && !limits.EnforceOnReauth) {
+		return nil
+	}
+
+	if slices.ContainsFunc(limits.ExemptUsers, func(entry string) bool {
+		return entry == user.Name || (user.Email != "" && entry == user.Email)
+	}) {
+		return nil
+	}
+
+	count := 0
+
+	for _, node := range s.nodeStore.ListNodesByUser(types.UserID(user.ID)).All() {
+		if node.IsTagged() ||
+			(existing.Valid() && node.ID() == existing.ID()) ||
+			(!limits.CountExpired && node.IsExpired()) ||
+			(!limits.CountEphemeral && node.IsEphemeral()) {
+			continue
+		}
+
+		count++
+	}
+
+	if count < limits.MaxNodesPerUser {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: user %q already has %d node(s), the maximum allowed is %d, contact your administrator",
+		ErrUserNodeLimitReached, user.Name, count, limits.MaxNodesPerUser,
+	)
 }
 
 // NewState creates and initializes a new [State] instance, setting up the database,
@@ -286,8 +351,9 @@ func NewState(cfg *types.Config) (*State, error) {
 		nodeStore: nodeStore,
 		pings:     newPingTracker(),
 
-		sshCheckAuth:  make(map[sshCheckPair]time.Time),
-		registerLocks: xsync.NewMap[key.MachinePublic, *sync.Mutex](),
+		sshCheckAuth:      make(map[sshCheckPair]time.Time),
+		registerLocks:     xsync.NewMap[key.MachinePublic, *sync.Mutex](),
+		userRegisterLocks: xsync.NewMap[types.UserID, *sync.Mutex](),
 	}
 
 	// Surface nodes whose stored data would break map generation (e.g. an
@@ -2414,6 +2480,7 @@ func (s *State) HandleNodeFromAuthPath(
 	// Serialise registration for this machine so concurrent auth callbacks
 	// resolve to a single node rather than racing the find-then-create section.
 	defer s.lockRegistration(machineKey)()
+	defer s.lockUserRegistration(types.UserID(user.ID))()
 
 	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
 
@@ -2440,6 +2507,26 @@ func (s *State) HandleNodeFromAuthPath(
 	// than converting an arbitrary node and orphaning the other.
 	if existingNodeIsTagged && (nodeExistsForSameUser || existingNodeOwnedByOtherUser) {
 		return types.NodeView{}, s.policyChangeSince(genBefore), ErrAmbiguousNodeOwnership
+	}
+
+	// Requested tags make the resulting node tag-owned, which never counts
+	// towards a user's node limit. Otherwise a same-user relogin
+	// re-authenticates an existing node, and every other branch below,
+	// including a tag->user conversion, gives the user one more node.
+	// The verdict carries the error to the waiting client.
+	if len(hostinfo.RequestTags) == 0 {
+		var reauthNode types.NodeView
+		if nodeExistsForSameUser {
+			reauthNode = existingNodeSameUser
+		}
+
+		err = s.checkUserNodeLimit(user, reauthNode)
+		if err != nil {
+			regEntry.FinishAuth(types.AuthVerdict{Err: err})
+			s.authCache.Remove(authID)
+
+			return types.NodeView{}, s.policyChangeSince(genBefore), err
+		}
 	}
 
 	// Create logger with common fields for all auth operations
@@ -2728,6 +2815,22 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Msg("Existing node re-registering with same NodeKey; lookup permits skipping key validation, writer re-decides")
 	} else {
 		err = pak.Validate()
+		if err != nil {
+			return types.NodeView{}, s.policyChangeSince(genBefore), err
+		}
+	}
+
+	// A tagged key registers a node owned by its tags, which never counts
+	// towards a user's node limit.
+	if pak.User != nil && !pak.IsTagged() {
+		defer s.lockUserRegistration(types.UserID(pak.User.ID))()
+
+		var reauthNode types.NodeView
+		if existsSameUser {
+			reauthNode = existingNodeSameUser
+		}
+
+		err = s.checkUserNodeLimit(pak.User, reauthNode)
 		if err != nil {
 			return types.NodeView{}, s.policyChangeSince(genBefore), err
 		}
